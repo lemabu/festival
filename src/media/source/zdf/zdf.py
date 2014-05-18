@@ -1,0 +1,143 @@
+from gi.repository import GObject, Gtk, Gdk
+import xml.etree.ElementTree as ET
+import threading, urllib2, string, os, time, random, logging
+
+class Episode(GObject.GObject):
+	#Public properies
+	guid = GObject.property(type=str, default='')
+	showId = GObject.property(type=str, default='')
+	title = GObject.property(type=str, default='')
+	description = GObject.property(type=str, default='')
+	pubDate = GObject.property(type=str, default='')
+	mediaUrl = GObject.property(type=str, default='')
+	
+	def __init__(self, guid, showId, title, description, pubDate, mediaUrl):
+		GObject.GObject.__init__(self)
+		self.guid = guid
+		self.showId = showId
+		self.title = title
+		self.description = description
+		self.pubDate = pubDate
+		self.mediaUrl = mediaUrl
+
+class Source(GObject.GObject):
+	#Public properies
+	name = GObject.property(type=str, default='ZDF', flags = GObject.PARAM_READABLE)
+
+	#Internal variables
+	__showsQueryUrlParts = ["http://www.zdf.de/ZDFmediathek/xmlservice/web/sendungenAbisZ?characterRangeStart=","&characterRangeEnd=","&detailLevel=2"]
+	__episodesQueryUrlParts = ["http://www.zdf.de/ZDFmediathek/rss/","?view=rss"]
+	__cacheDir = ""
+	__shows = Gtk.ListStore(str, str, str, str)
+	__episodes = Gtk.ListStore(str, str, str, str, str, str)
+	__showsLock = threading.Lock();
+	
+	#Signals we will / may emit
+	__gsignals__ = {
+		'data_update_shows': (GObject.SIGNAL_RUN_FIRST, None, (int,))
+    }
+
+	def getName(self):
+		return self.name
+	
+	def __AS_getEpisodes(self, showId):
+		print "__AS_getEpisodes running in "+threading.current_thread().name
+		Gdk.threads_enter()
+		queryUrl=self.__episodesQueryUrlParts[0]+showId+self.__episodesQueryUrlParts[1]
+		Gdk.threads_leave()
+		u = urllib2.urlopen(queryUrl)
+		xmlTree = ET.fromstring(u.read())
+		Gdk.threads_enter()
+		self.__episodes.clear()
+		Gdk.threads_leave()
+		for item in xmlTree.iter("item"):
+			mediaFileUrls = None
+			videoUrl = None
+			namespace = "http://search.yahoo.com/mrss/"
+			groupElem = item.find('{%s}group' % namespace)
+			if groupElem is not None:
+				mediaFileUrls = groupElem.findall('{%s}content' % namespace)
+			if mediaFileUrls is not None:
+				for element in mediaFileUrls:
+					if (element.attrib["url"][len(element.attrib["url"])-3:]) == "mov":
+						videoUrl = element.attrib["url"]
+						break	
+			if videoUrl != None:
+				Gdk.threads_enter()
+				episodeInfoLS = [item.find("guid").text, showId, item.find("title").text, item.find("description").text, item.find("pubDate").text, videoUrl]
+				self.__episodes.append(episodeInfoLS)
+				Gdk.threads_leave()
+	
+	def __AS_updateShows(self):
+		#We need all the letters in the alphabet to make the API calls
+		alpha = string.ascii_uppercase
+		#alpha = ['A','B','C']
+		#Call once for each letter
+		for letter in alpha:
+			queryUrl= self.__showsQueryUrlParts[0]+letter+self.__showsQueryUrlParts[1]+letter+self.__showsQueryUrlParts[2]
+			u = urllib2.urlopen(queryUrl)
+			xmlTree = ET.fromstring(u.read())
+			for teaser in xmlTree.iter('teaser'):
+				#Find teaser image url
+				teaserImageUrl = None
+				allTImages = teaser.find("teaserimages").findall("teaserimage")
+				for image in allTImages:
+					if image.attrib["key"]=="298x168":
+						teaserImageUrl = image.text
+				if teaserImageUrl == None:
+					teaserImageUrl = "no-teaser"
+				showInfoLS = [teaser.find("details").find("assetId").text, teaser.find("information").find("title").text, teaser.find("information").find("detail").text, teaserImageUrl]
+				Gdk.threads_enter()
+				self.__shows.append(showInfoLS)
+				#self.emit("data_update_shows",5)
+				Gdk.threads_leave()
+	
+	def __AS_getImageFromCacheOrDownload(self, url, view):
+		#view.set_from_file("/home/marcel/3075396")
+		fileName=url.split("/")[-1]
+		fullFilePath = self.__cacheDir+"/"+fileName
+		try:
+   			with open(fullFilePath) as f: pass
+		except IOError as e:
+   			print 'Oh dear, ' +fileName+ ' does not exist'
+			u = urllib2.urlopen(url)
+			localFile = open(fullFilePath, 'w')
+			localFile.write(u.read())
+			localFile.close()
+		Gdk.threads_enter()
+		view.set_from_file(fullFilePath)
+		Gdk.threads_leave()
+
+	def getShows(self):
+		return self.__shows
+
+	def getEpisodes(self):
+		return self.__episodes
+		
+	def getEpisode(self, path):
+		guid = self.__episodes.get_value(self.__episodes.get_iter(path),0)
+		showId = self.__episodes.get_value(self.__episodes.get_iter(path),1)
+		title = self.__episodes.get_value(self.__episodes.get_iter(path),2)
+		description = self.__episodes.get_value(self.__episodes.get_iter(path),3)
+		pubDate = self.__episodes.get_value(self.__episodes.get_iter(path),4)
+		mediaUrl = self.__episodes.get_value(self.__episodes.get_iter(path),5)
+		return Episode(guid, showId, title, description, pubDate, mediaUrl)
+ 
+
+	def setSelectedShow(self, path, imageView):
+		print "setSelectedShow running in "+threading.current_thread().name
+		showId = self.__shows.get_value(self.__shows.get_iter(path),0)
+		teaserImgUrl = self.__shows.get_value(self.__shows.get_iter(path),3)
+		imageGetter = threading.Thread(target=self.__AS_getImageFromCacheOrDownload, name="Teaser-Update-Thread", args=(teaserImgUrl, imageView,))
+		imageGetter.start()
+		updater = threading.Thread(target=self.__AS_getEpisodes, name="Episodes-Update-Thread", args=(showId,))
+		updater.start()
+	
+	def __init__(self):
+		GObject.GObject.__init__(self)
+		self.__cacheDir=os.getenv("HOME")+"/.cache/festival/zdf"
+		#See if cache dir exists, if ! -> create
+		if not os.path.exists(self.__cacheDir):
+			os.makedirs(self.__cacheDir)
+		updater = threading.Thread(target=self.__AS_updateShows, name="Show-Update-Thread")
+		updater.start()
